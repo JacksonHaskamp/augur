@@ -49,11 +49,129 @@ class GitHubPullRequestWorker(WorkerGitInterfaceable):
 
         # Define data collection info
         self.tool_source = 'GitHub Pull Request Worker'
-        self.tool_version = '1.0.0'
+        self.tool_version = '1.2.0'
         self.data_source = 'GitHub API'
 
         #Needs to be an attribute of the class for incremental database insert using paginate_endpoint
         self.pk_source_prs = []
+
+    #Only used by the pull request worker's review_model_outfactor
+    def multi_thread_urls(self, all_urls, max_attempts=5, platform='github'):
+        """
+        :param all_urls: list of tuples
+        """
+
+        if not len(all_urls):
+            self.logger.info("No urls to multithread, returning blank list.\n")
+            return []
+
+        def load_url(url, extra_data={}):
+            try:
+                html = requests.get(url, stream=True, headers=self.headers)
+                return html, extra_data
+            except requests.exceptions.RequestException as e:
+                self.logger.debug(f"load_url inside multi_thread_urls failed with {e}, for usl {url}. exception registerred.registered")
+
+        self.logger.info("Beginning to multithread API endpoints.")
+
+        start = time.time()
+
+        all_data = []
+        valid_url_count = len(all_urls)
+
+        partitions = math.ceil(len(all_urls) / 600)
+        self.logger.info(f"{len(all_urls)} urls to process. Trying {partitions} partitions. " +
+            f"Using {max(multiprocessing.cpu_count()//8, 1)} threads.")
+        for urls in numpy.array_split(all_urls, partitions):
+            attempts = 0
+            self.logger.info(f"Total data points collected so far: {len(all_data)}")
+            while len(urls) > 0 and attempts < max_attempts:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max(multiprocessing.cpu_count()//8, 1)
+                ) as executor:
+                    # Start the load operations and mark each future with its URL
+                    future_to_url = {executor.submit(load_url, *url): url for url in urls}
+                    self.logger.info("Multithreaded urls and returned status codes:")
+                    count = 0
+                    for future in concurrent.futures.as_completed(future_to_url):
+
+                        if count % 100 == 0:
+                            self.logger.info(
+                                f"Processed {len(all_data)} / {valid_url_count} urls. "
+                                f"{len(urls)} remaining in this partition."
+                            )
+                        count += 1
+
+                        url = future_to_url[future]
+                        try:
+                            response, extra_data = future.result()
+
+                            if response.status_code != 200:
+                                self.logger.debug(
+                                    f"Url: {url[0]} ; Status code: {response.status_code}"
+                                )
+
+                            if response.status_code == 403 or response.status_code == 401: # 403 is rate limit, 404 is not found, 401 is bad credentials
+                                self.update_rate_limit(response, platform=platform)
+                                continue
+
+                            elif response.status_code == 200:
+                                try:
+                                    page_data = response.json() 
+                                    # This seems to not be working.
+                                    ### added by SPG 12/1/2021 for dealing with empty JSON pages where there
+                                    ### are no reviews.
+                                    #if not 'results' in page_data or len(page_data['results']) == 0:
+                                    #    continue  
+                                  
+                                except:
+                                    page_data = json.loads(json.dumps(response.text))
+                                    continue
+
+                                page_data = [{**data, **extra_data} for data in page_data]
+                                all_data += page_data
+
+                                try:
+                                    if 'last' in response.links and "&page=" not in url[0]:
+                                        urls += [
+                                            (url[0] + f"&page={page}", extra_data) for page in range(
+                                                2, int(response.links['last']['url'].split('=')[-1]) + 1
+                                            )
+                                        ]
+                                        # self.logger.info(f"urls boundry issue? for {urls} where they are equal to {url}.")
+
+                                        urls = numpy.delete(urls, numpy.where(urls == url), axis=0)
+                                except:
+                                    self.logger.info(f"ERROR with axis = 0 - Now attempting without setting axis for numpy.delete for {urls} where they are equal to {url}.")
+                                    urls = numpy.delete(urls, numpy.where(urls == url))
+                                    continue
+
+                            elif response.status_code == 404:
+                                urls = numpy.delete(urls, numpy.where(urls == url), axis=0)
+                                self.logger.info(f"Not found url: {url}\n")
+                            else:
+                                self.logger.info(
+                                    f"Unhandled response code: {response.status_code} {url}\n"
+                                )
+
+                        ## Added additional exception logging and a pass in this block.
+                        except Exception as e:
+                            self.logger.debug(
+                                f"{url} generated an exception: count is {count}, attemts are {attempts}."
+                            )
+                            stacker = traceback.format_exc()
+                            self.logger.debug(f"\n\n{stacker}\n\n")
+                            pass
+
+                attempts += 1
+
+        self.logger.debug(
+            f"Processed {valid_url_count} urls and got {len(all_data)} data points "
+            f"in {time.time() - start} seconds thanks to multithreading!\n"
+        )
+        return all_data
+
+
 
     def graphql_paginate(self, query, data_subjects, before_parameters=None):
         """ Paginate a GitHub GraphQL query backwards
@@ -383,7 +501,7 @@ class GitHubPullRequestWorker(WorkerGitInterfaceable):
         #self.owner and self.repo are both defined in the worker base's collect method using the url of the github repo.
         pr_url = (
             f"https://api.github.com/repos/{self.owner}/{self.repo}/pulls?state=all&"
-            "direction=asc&per_page=100&page={}"
+            "direction=desc&per_page=100&page={}"
         )
 
         #Database action map is essential in order to avoid duplicates messing up the data
@@ -437,7 +555,7 @@ class GitHubPullRequestWorker(WorkerGitInterfaceable):
                 {
                     'repo_id': self.repo_id,
                     'pr_url': pr['url'],
-                    'pr_src_id': pr['id'],
+                    'pr_src_id': int(str(pr['id']).encode(encoding='UTF-8').decode(encoding='UTF-8')),#1-22-2022 inconsistent casting; sometimes int, sometimes float in bulk_insert 
                     'pr_src_node_id': pr['node_id'],  ## 9/20/2021 - This was null. No idea why.
                     'pr_html_url': pr['html_url'],
                     'pr_diff_url': pr['diff_url'],
@@ -459,10 +577,10 @@ class GitHubPullRequestWorker(WorkerGitInterfaceable):
                     ) else None,
                     'pr_created_at': pr['created_at'],
                     'pr_updated_at': pr['updated_at'],
-                    'pr_closed_at': s.sql.expression.null() if not (  # This had to be changed because "None" is JSON. SQL requires NULL SPG 11/28/2021
+                    'pr_closed_at': None if not (  
                         pr['closed_at']
                     ) else pr['closed_at'],
-                    'pr_merged_at': None if not (  # This had to be changed because "None" is JSON. SQL requires NULL
+                    'pr_merged_at': None if not (  
                         pr['merged_at']
                     ) else pr['merged_at'],
                     'pr_merge_commit_sha': pr['merge_commit_sha'],
@@ -523,7 +641,8 @@ class GitHubPullRequestWorker(WorkerGitInterfaceable):
                 self.bulk_insert(
                     self.pull_requests_table,
                     update=inc_source_prs['update'], unique_columns=action_map['insert']['augur'],
-                    insert=prs_insert, update_columns=['pr_src_state', 'pr_closed_at', 'pr_updated_at', 'pr_merged_at']
+                    insert=prs_insert, update_columns=['pr_src_state', 'pr_closed_at', 'pr_updated_at', 'pr_merged_at'],
+                    convert_float_int=True
                 )
 
                 source_data = inc_source_prs['insert'] + inc_source_prs['update']
